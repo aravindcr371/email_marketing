@@ -106,7 +106,12 @@ def compute_weekdays_for_choice(choice, filtered_months, month_labels,
     return working_days_between(start, end)
 
 # ------------------ Tabs ------------------
-tab1, tab2, tab3 = st.tabs(["📝 Email Marketing", "📊 Visuals", "📈 Utilization & Occupancy"])
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📝 Email Marketing",
+    "📊 Visuals",
+    "📈 Utilization & Occupancy",
+    "🔎 Utilization Check"
+])
 
 # ------------------ TAB 1 ------------------
 with tab1:
@@ -431,3 +436,99 @@ with tab3:
             pivot = pivot.reindex(columns=final_cols)
 
             st.dataframe(pivot, use_container_width=True)
+
+# ------------------ TAB 4: Utilization Check ------------------
+with tab4:
+    st.title("Utilization Check (Raw Entries by Component & Member)")
+    try:
+        response = supabase.table("email_marketing").select("*").execute()
+        chk = pd.DataFrame(response.data)
+    except Exception as e:
+        st.error(f"Error fetching data: {e}")
+        chk = pd.DataFrame()
+
+    if chk.empty:
+        st.info("No data available")
+    else:
+        # normalize/prepare
+        chk["date"] = pd.to_datetime(chk["date"], errors="coerce")
+        chk["hours"] = chk["duration"] / 60.0
+        # flags to see what gets ignored
+        chk["is_utilized"] = ~chk["component"].isin(["Break","Leave"])
+        chk["is_occupied"] = ~chk["component"].isin(["Break","Leave","Meeting"])
+
+        options, filtered_months, month_labels, previous_month_period, today, current_weekday, current_month, current_year = build_period_options_and_months(chk["date"])
+        choice = st.selectbox("Select period", options, key="tab4_period")
+
+        weekdays = compute_weekdays_for_choice(choice, filtered_months, month_labels, previous_month_period,
+                                               today, current_weekday, current_month, current_year)
+
+        period_chk = chk[chk["date"].dt.normalize().isin(weekdays)]
+
+        if period_chk.empty:
+            st.info("No entries for the selected period.")
+        else:
+            # Order components for display
+            comp_order = (
+                period_chk.groupby("component")["duration"]
+                .sum()
+                .sort_values(ascending=False)
+                .index.tolist()
+            )
+
+            # Ensure clean component labels
+            period_chk["component"] = period_chk["component"].fillna("Unspecified")
+            period_chk.loc[period_chk["component"].eq(""), "component"] = "Unspecified"
+
+            # For each component, print entries grouped by member
+            for comp in comp_order:
+                with st.expander(f"Component: {comp}", expanded=False):
+                    comp_df = period_chk[period_chk["component"] == comp].copy()
+
+                    # member-wise sum for quick header context
+                    member_summ = (
+                        comp_df.groupby("member")["duration"]
+                        .sum()
+                        .div(60.0)
+                        .round(1)
+                        .reset_index()
+                        .rename(columns={"duration":"Hours (sum)"})
+                    )
+                    st.markdown("**Member-wise totals (hours):**")
+                    st.dataframe(member_summ, use_container_width=True)
+
+                    # detailed rows per member
+                    members_in_comp = comp_df["member"].dropna().unique().tolist()
+                    # keep MEMBERS order where possible
+                    ordered_members = [m for m in MEMBERS if m != "-- Select --" and m in members_in_comp]
+                    other_members = [m for m in members_in_comp if m not in ordered_members]
+                    show_members = ordered_members + other_members
+
+                    for mem in show_members:
+                        mem_rows = comp_df[comp_df["member"] == mem].copy()
+                        if mem_rows.empty:
+                            continue
+
+                        st.markdown(f"**Entries for {mem}:**")
+                        display_cols = [
+                            "date","member","component",
+                            "tickets","banners","sku","pages",
+                            "duration","hours","comments",
+                            "is_utilized","is_occupied"
+                        ]
+                        # ensure cols exist
+                        present_cols = [c for c in display_cols if c in mem_rows.columns]
+                        mem_rows = mem_rows[present_cols]
+                        # sort by date ascending for audit trail
+                        mem_rows = mem_rows.sort_values("date")
+                        st.dataframe(mem_rows, use_container_width=True)
+
+            # Optional: global summary to reconcile totals across all components/members
+            st.markdown("---")
+            st.subheader("Global Summary for Selected Period")
+            global_summary = pd.DataFrame({
+                "Total Recorded Hours": [round(period_chk["duration"].sum() / 60.0, 1)],
+                "Utilized Hours (excl. Break/Leave)": [round(period_chk.loc[period_chk["is_utilized"], "duration"].sum() / 60.0, 1)],
+                "Occupied Hours (excl. Break/Leave/Meeting)": [round(period_chk.loc[period_chk["is_occupied"], "duration"].sum() / 60.0, 1)],
+            })
+            st.dataframe(global_summary, use_container_width=True)
