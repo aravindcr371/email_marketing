@@ -46,21 +46,37 @@ def working_days_between(start: date, end: date):
     return [d.normalize() for d in days if d.weekday() < 5 and d.date() not in PUBLIC_HOLIDAYS]
 
 def build_period_options_and_months(df_dates: pd.Series):
+    """
+    Build period options:
+      - Always include 'Current Week', 'Previous Week', 'Current Month', 'Previous Month'
+      - Include months >= Nov 2024 found in data
+      - Always include 'November 2024' explicitly, even if not present in data
+      - Exclude the computed 'Previous Month' from explicit month labels to avoid duplication
+    """
     today = date.today()
     current_weekday = today.weekday()
     current_month = today.month
     current_year = today.year
 
+    # Convert to monthly periods based on available data
     year_month = pd.to_datetime(df_dates, errors="coerce").dt.to_period("M")
-    available_months = sorted([m for m in year_month.unique()
-                               if (m.year > 2024 or (m.year == 2024 and m.month >= 11))])
 
+    # Explicitly include November 2024
+    explicit_months = {pd.Period("2024-11")}
+
+    available_months = set(
+        m for m in year_month.unique()
+        if (m.year > 2024 or (m.year == 2024 and m.month >= 11))
+    )
+    # Union with explicit month(s)
+    months_union = sorted(available_months.union(explicit_months))
+
+    # Work out previous month and exclude it from labels to avoid duplication
     prev_month = current_month - 1 if current_month > 1 else 12
     prev_year = current_year if current_month > 1 else current_year - 1
     previous_month_period = pd.Period(f"{prev_year}-{prev_month:02d}")
 
-    # Exclude previous month from month labels to avoid duplication with "Previous Month"
-    filtered_months = [m for m in available_months if m != previous_month_period]
+    filtered_months = [m for m in months_union if m != previous_month_period]
     month_labels = [f"{m.strftime('%B %Y')}" for m in filtered_months]
 
     options = ["Current Week", "Previous Week", "Current Month", "Previous Month"] + month_labels
@@ -359,3 +375,50 @@ with tab3:
 
             st.subheader("Team Utilization & Occupancy")
             st.dataframe(team_df, use_container_width=True)
+
+            # ------------------ Utilization by Component × Member ------------------
+            st.subheader("Utilization by Component × Member")
+
+            # Member-level total hours map (used as denominator for %)
+            member_totals = agg.set_index("member")["total_hours"].to_dict()
+
+            # Component × Member utilized hours (utilization excludes Break/Leave already)
+            comp_member = period_df.groupby(["component", "member"])["utilization_hours"].sum().reset_index()
+
+            # Clean component labels
+            comp_member["component"] = comp_member["component"].fillna("Unspecified")
+            comp_member.loc[comp_member["component"].eq(""), "component"] = "Unspecified"
+
+            # Compute % of member overall hours for the selected period
+            comp_member["pct_of_member"] = comp_member.apply(
+                lambda r: ((r["utilization_hours"] / member_totals.get(r["member"], 0)) * 100)
+                if member_totals.get(r["member"], 0) > 0 else 0.0,
+                axis=1
+            )
+
+            # Display cell: "<hours>h (<pct>%)", both to 1 decimal
+            comp_member["cell"] = comp_member.apply(
+                lambda r: f"{r['utilization_hours']:.1f}h ({r['pct_of_member']:.1f}%)",
+                axis=1
+            )
+
+            # Pivot to components (rows) × members (columns)
+            pivot = comp_member.pivot(index="component", columns="member", values="cell").fillna("0.0h (0.0%)")
+
+            # Order components by total utilized hours descending to show highest-impact first
+            comp_order = (
+                comp_member.groupby("component")["utilization_hours"]
+                .sum()
+                .sort_values(ascending=False)
+                .index
+            )
+            pivot = pivot.loc[comp_order]
+
+            # Optional: order member columns using the known MEMBERS list (excluding placeholder)
+            ordered_members = [m for m in MEMBERS if m != "-- Select --"]
+            existing_members = [m for m in ordered_members if m in pivot.columns]
+            other_members = [m for m in pivot.columns if m not in existing_members]
+            final_cols = existing_members + other_members
+            pivot = pivot.reindex(columns=final_cols)
+
+            st.dataframe(pivot, use_container_width=True)
