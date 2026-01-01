@@ -20,7 +20,7 @@ COMPONENTS = ["-- Select --","Edits","Email Built","Legal","Meeting","Others",
 
 RESET_KEYS = [
     "date_field", "member_field", "component_field",
-    "tickets_field", "banners_field", "sku_field", "pages_field",  # <-- added
+    "tickets_field", "banners_field", "sku_field", "pages_field",
     "hours_field", "minutes_field", "comments_field"
 ]
 
@@ -43,6 +43,7 @@ def end_of_month(y: int, m: int) -> date:
 
 def working_days_between(start: date, end: date):
     days = pd.date_range(start, end, freq="D")
+    # normalize to midnight to match .dt.normalize()
     return [d.normalize() for d in days if d.weekday() < 5 and d.date() not in PUBLIC_HOLIDAYS]
 
 def build_period_options_and_months(df_dates: pd.Series):
@@ -157,8 +158,8 @@ with tab1:
                 "component": component,
                 "tickets": int(tickets),
                 "banners": int(banners),
-                "sku": int(sku),     # <-- added
-                "pages": int(pages), # <-- added
+                "sku": int(sku),
+                "pages": int(pages),
                 "duration": duration_minutes,
                 "comments": (comments or "").strip() or None
             }
@@ -294,6 +295,7 @@ with tab3:
     else:
         df = raw.copy()
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        # derived hour views for member/summary blocks (not used for pivot fix)
         df["hours"] = df["duration"] / 60.0
         df["utilization_hours"] = df.apply(lambda r: 0 if r["component"] in ["Break","Leave"] else r["hours"], axis=1)
         df["occupancy_hours"] = df.apply(lambda r: 0 if r["component"] in ["Break","Leave","Meeting"] else r["hours"], axis=1)
@@ -305,12 +307,14 @@ with tab3:
         weekdays = compute_weekdays_for_choice(choice, filtered_months, month_labels, previous_month_period,
                                                today, current_weekday, current_month, current_year)
 
+        # Use normalized dates for matching weekdays list
         period_df = df[df["date"].dt.normalize().isin(weekdays)]
         baseline_hours_period = len(weekdays) * 8
 
         if period_df.empty:
             st.info("No data for the selected period.")
         else:
+            # ------ Member Utilization & Occupancy (existing block) ------
             agg = period_df.groupby("member").agg(
                 utilized_hours=("utilization_hours","sum"),
                 occupied_hours=("occupancy_hours","sum"),
@@ -376,38 +380,43 @@ with tab3:
             st.subheader("Team Utilization & Occupancy")
             st.dataframe(team_df, use_container_width=True)
 
-            # ------------------ Utilization by Component × Member ------------------
+            # ------------------ Utilization by Component × Member (FIXED) ------------------
             st.subheader("Utilization by Component × Member")
 
-            # Member-level total hours map (used as denominator for %)
-            member_totals = agg.set_index("member")["total_hours"].to_dict()
+            # Exclude Break/Leave rows for utilization view (keep raw duration for accuracy)
+            util_df = period_df[~period_df["component"].isin(["Break","Leave"])].copy()
 
-            # Component × Member utilized hours (utilization excludes Break/Leave already)
-            comp_member = period_df.groupby(["component", "member"])["utilization_hours"].sum().reset_index()
+            # Sum raw duration (minutes) by (component, member), then convert to hours
+            comp_member_minutes = util_df.groupby(["component", "member"])["duration"].sum().reset_index()
+            comp_member_minutes["hours"] = comp_member_minutes["duration"] / 60.0
 
             # Clean component labels
-            comp_member["component"] = comp_member["component"].fillna("Unspecified")
-            comp_member.loc[comp_member["component"].eq(""), "component"] = "Unspecified"
+            comp_member_minutes["component"] = comp_member_minutes["component"].fillna("Unspecified")
+            comp_member_minutes.loc[comp_member_minutes["component"].eq(""), "component"] = "Unspecified"
 
-            # Compute % of member overall hours for the selected period
-            comp_member["pct_of_member"] = comp_member.apply(
-                lambda r: ((r["utilization_hours"] / member_totals.get(r["member"], 0)) * 100)
-                if member_totals.get(r["member"], 0) > 0 else 0.0,
+            # Member overall recorded hours in the selected period (denominator for %)
+            member_totals_minutes = period_df.groupby("member")["duration"].sum()
+            member_totals_hours = (member_totals_minutes / 60.0).to_dict()
+
+            # Compute % of member overall recorded hours
+            comp_member_minutes["pct_of_member"] = comp_member_minutes.apply(
+                lambda r: ((r["hours"] / member_totals_hours.get(r["member"], 0)) * 100)
+                if member_totals_hours.get(r["member"], 0) > 0 else 0.0,
                 axis=1
             )
 
             # Display cell: "<hours>h (<pct>%)", both to 1 decimal
-            comp_member["cell"] = comp_member.apply(
-                lambda r: f"{r['utilization_hours']:.1f}h ({r['pct_of_member']:.1f}%)",
+            comp_member_minutes["cell"] = comp_member_minutes.apply(
+                lambda r: f"{r['hours']:.1f}h ({r['pct_of_member']:.1f}%)",
                 axis=1
             )
 
             # Pivot to components (rows) × members (columns)
-            pivot = comp_member.pivot(index="component", columns="member", values="cell").fillna("0.0h (0.0%)")
+            pivot = comp_member_minutes.pivot(index="component", columns="member", values="cell").fillna("0.0h (0.0%)")
 
             # Order components by total utilized hours descending to show highest-impact first
             comp_order = (
-                comp_member.groupby("component")["utilization_hours"]
+                comp_member_minutes.groupby("component")["hours"]
                 .sum()
                 .sort_values(ascending=False)
                 .index
