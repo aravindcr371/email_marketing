@@ -45,26 +45,17 @@ def working_days_between(start: date, end: date):
     return [d.normalize() for d in days if d.weekday() < 5 and d.date() not in PUBLIC_HOLIDAYS]
 
 def build_period_options_and_months(df_dates: pd.Series):
-    """
-    Build period options:
-      - Always include 'Current Week', 'Previous Week', 'Current Month', 'Previous Month'
-      - Include months >= Nov 2024 that are present in the data (no explicit forcing of Nov 2024)
-      - Exclude the computed 'Previous Month' from explicit month labels to avoid duplication
-    """
     today = date.today()
     current_weekday = today.weekday()
     current_month = today.month
     current_year = today.year
 
     year_month = pd.to_datetime(df_dates, errors="coerce").dt.to_period("M")
-
-    # Only months present in data; keep >= Nov 2024 rule from your prior logic
     months_union = sorted([
         m for m in year_month.unique()
         if (m.year > 2024 or (m.year == 2024 and m.month >= 11))
     ])
 
-    # Compute previous month for exclusion in labels
     prev_month = current_month - 1 if current_month > 1 else 12
     prev_year = current_year if current_month > 1 else current_year - 1
     previous_month_period = pd.Period(f"{prev_year}-{prev_month:02d}")
@@ -113,10 +104,8 @@ with tab1:
         with c2:
             component = st.selectbox("Component", COMPONENTS)
 
-        # Tickets only (removed banners, sku, pages from frontend)
         tickets = st.number_input("Tickets", min_value=0, step=1, key="tickets_field")
 
-        # Hours & Minutes
         c3, c4 = st.columns(2)
         with c3:
             hours = st.selectbox("Hours", list(range(24)), key="hours_field")
@@ -138,7 +127,6 @@ with tab1:
                 "member": member,
                 "component": component,
                 "tickets": int(tickets),
-                # Removed banners/sku/pages from frontend; not inserting them
                 "duration": duration_minutes,
                 "comments": (comments or "").strip() or None
             }
@@ -166,6 +154,11 @@ with tab1:
     if not df1.empty:
         df1["date"] = pd.to_datetime(df1["date"], errors="coerce")
         df1 = df1[df1["team"] == TEAM]  # Show only entries for TEAM
+
+        # Drop unwanted columns: id, banners, sku, pages if present
+        drop_cols = [col for col in ["id", "banners", "sku", "pages"] if col in df1.columns]
+        df1 = df1.drop(columns=drop_cols)
+
         st.subheader(f"Latest entries for {TEAM} (sorted by Date descending)")
         st.dataframe(df1, use_container_width=True)
 
@@ -184,7 +177,7 @@ with tab2:
     else:
         vdf["date"] = pd.to_datetime(vdf["date"], errors="coerce")
         options, filtered_months, month_labels, previous_month_period, today, current_weekday, current_month, current_year = build_period_options_and_months(vdf["date"])
-        choice = st.selectbox("Select period", options, key="tab2_period")  # unique key
+        choice = st.selectbox("Select period", options, key="tab2_period")
         weekdays = compute_weekdays_for_choice(choice, filtered_months, month_labels, previous_month_period,
                                                today, current_weekday, current_month, current_year)
         filtered = vdf[vdf["date"].dt.normalize().isin(weekdays)]
@@ -242,138 +235,3 @@ with tab2:
                 ]
             )
             st.altair_chart(chart, use_container_width=True)
-
-# ------------------ TAB 3 ------------------
-with tab3:
-    st.title("Utilization & Occupancy")
-    try:
-        response = supabase.table("email_marketing").select("*").execute()
-        raw = pd.DataFrame(response.data)
-    except Exception as e:
-        st.error(f"Error fetching data: {e}")
-        raw = pd.DataFrame()
-
-    if raw.empty:
-        st.info("No data available")
-    else:
-        df = raw.copy()
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        df["hours"] = df["duration"] / 60.0
-        df["utilization_hours"] = df.apply(lambda r: 0 if r["component"] in ["Break","Leave"] else r["hours"], axis=1)
-        df["occupancy_hours"] = df.apply(lambda r: 0 if r["component"] in ["Break","Leave","Meeting"] else r["hours"], axis=1)
-        df["leave_hours"] = df.apply(lambda r: r["hours"] if r["component"] == "Leave" else 0, axis=1)
-
-        options, filtered_months, month_labels, previous_month_period, today, current_weekday, current_month, current_year = build_period_options_and_months(df["date"])
-        choice = st.selectbox("Select period", options, key="tab3_period")  # unique key
-
-        weekdays = compute_weekdays_for_choice(choice, filtered_months, month_labels, previous_month_period,
-                                               today, current_weekday, current_month, current_year)
-
-        period_df = df[df["date"].dt.normalize().isin(weekdays)]
-        baseline_hours_period = len(weekdays) * 8
-
-        if period_df.empty:
-            st.info("No data for the selected period.")
-        else:
-            agg = period_df.groupby("member").agg(
-                utilized_hours=("utilization_hours","sum"),
-                occupied_hours=("occupancy_hours","sum"),
-                leave_hours=("leave_hours","sum")
-            ).reset_index()
-
-            agg["total_hours"] = baseline_hours_period - agg["leave_hours"]
-
-            agg["utilization_%"] = (
-                (agg["utilized_hours"]/agg["total_hours"]).where(agg["total_hours"] > 0, 0) * 100
-            ).round(1)
-            agg["occupancy_%"] = (
-                (agg["occupied_hours"]/agg["total_hours"]).where(agg["total_hours"] > 0, 0) * 100
-            ).round(1)
-
-            agg["utilized_hours"] = agg["utilized_hours"].round(1)
-            agg["occupied_hours"] = agg["occupied_hours"].round(1)
-            agg["leave_hours"] = agg["leave_hours"].round(1)
-            agg["total_hours"] = agg["total_hours"].round(1)
-
-            merged_stats = agg.rename(columns={
-                "member": "Name",
-                "total_hours": "Total Hours",
-                "leave_hours": "Leave Hours",
-                "utilized_hours": "Utilized Hours",
-                "occupied_hours": "Occupied Hours",
-                "utilization_%": "Utilization %",
-                "occupancy_%": "Occupancy %"
-            })
-
-            numeric_cols = ["Total Hours","Leave Hours","Utilized Hours","Occupied Hours","Utilization %","Occupancy %"]
-            for col in numeric_cols:
-                merged_stats[col] = merged_stats[col].astype(float).round(1)
-
-            st.subheader("Member Utilization & Occupancy")
-            st.dataframe(
-                merged_stats[["Name","Total Hours","Leave Hours","Utilized Hours","Occupied Hours","Utilization %","Occupancy %"]],
-                use_container_width=True
-            )
-
-            team_total = float(merged_stats["Total Hours"].sum())
-            team_leave = float(merged_stats["Leave Hours"].sum())
-            team_utilized = float(merged_stats["Utilized Hours"].sum())
-            team_occupied = float(merged_stats["Occupied Hours"].sum())
-
-            team_util_pct = (team_utilized / team_total * 100) if team_total > 0 else 0.0
-            team_occ_pct = (team_occupied / team_total * 100) if team_total > 0 else 0.0
-
-            team_df = pd.DataFrame({
-                "Team": [TEAM],
-                "Total Hours": [round(team_total, 1)],
-                "Leave Hours": [round(team_leave, 1)],
-                "Utilized Hours": [round(team_utilized, 1)],
-                "Occupied Hours": [round(team_occupied, 1)],
-                "Utilization %": [round(team_util_pct, 1)],
-                "Occupancy %": [round(team_occ_pct, 1)]
-            })
-
-            st.subheader("Team Utilization & Occupancy")
-            st.dataframe(team_df, use_container_width=True)
-
-            # Utilization by Component × Member (hours from raw duration; % of member's total recorded hours)
-            st.subheader("Utilization by Component × Member")
-            util_df = period_df[~period_df["component"].isin(["Break","Leave"])].copy()
-
-            comp_member_minutes = util_df.groupby(["component", "member"])["duration"].sum().reset_index()
-            comp_member_minutes["hours"] = comp_member_minutes["duration"] / 60.0
-
-            comp_member_minutes["component"] = comp_member_minutes["component"].fillna("Unspecified")
-            comp_member_minutes.loc[comp_member_minutes["component"].eq(""), "component"] = "Unspecified"
-
-            member_totals_minutes = period_df.groupby("member")["duration"].sum()
-            member_totals_hours = (member_totals_minutes / 60.0).to_dict()
-
-            comp_member_minutes["pct_of_member"] = comp_member_minutes.apply(
-                lambda r: ((r["hours"] / member_totals_hours.get(r["member"], 0)) * 100)
-                if member_totals_hours.get(r["member"], 0) > 0 else 0.0,
-                axis=1
-            )
-
-            comp_member_minutes["cell"] = comp_member_minutes.apply(
-                lambda r: f"{r['hours']:.1f}h ({r['pct_of_member']:.1f}%)",
-                axis=1
-            )
-
-            pivot = comp_member_minutes.pivot(index="component", columns="member", values="cell").fillna("0.0h (0.0%)")
-
-            comp_order = (
-                comp_member_minutes.groupby("component")["hours"]
-                .sum()
-                .sort_values(ascending=False)
-                .index
-            )
-            pivot = pivot.loc[comp_order]
-
-            ordered_members = [m for m in MEMBERS if m != "-- Select --"]
-            existing_members = [m for m in ordered_members if m in pivot.columns]
-            other_members = [m for m in pivot.columns if m not in existing_members]
-            final_cols = existing_members + other_members
-            pivot = pivot.reindex(columns=final_cols)
-
-            st.dataframe(pivot, use_container_width=True)
